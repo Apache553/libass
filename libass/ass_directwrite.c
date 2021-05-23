@@ -38,6 +38,37 @@ static const ASS_FontMapping font_substitutions[] = {
     {"monospace", "Courier New"}
 };
 
+
+/*
+ * function prototypes to avoid import libs
+ */
+typedef HRESULT(WINAPI* DWriteCreateFactoryFn)(
+    DWRITE_FACTORY_TYPE factoryType,
+    REFIID              iid,
+    IUnknown** factory
+    );
+
+typedef HDC(WINAPI* CreateCompatibleDCFn)(
+    HDC hdc
+    );
+
+typedef HFONT(WINAPI* CreateFontIndirectWFn)(
+    CONST LOGFONTW* lplf
+    );
+
+typedef BOOL(WINAPI* DeleteDCFn)(
+    HDC hdc
+    );
+
+typedef BOOL(WINAPI* DeleteObjectFn)(
+    HGDIOBJ ho
+    );
+
+typedef HGDIOBJ(WINAPI* SelectObjectFn)(
+    HDC hdc, 
+    HGDIOBJ h
+    );
+
 /*
  * The private data stored for every font, detected by this backend.
  */
@@ -49,8 +80,15 @@ typedef struct {
 
 typedef struct {
     HMODULE directwrite_lib;
+    HMODULE gdi32_lib;
     IDWriteFactory *factory;
     IDWriteGdiInterop *gdi_interop;
+
+    CreateCompatibleDCFn CreateCompatibleDC;
+    CreateFontIndirectWFn CreateFontIndirectW;
+    DeleteDCFn DeleteDC;
+    DeleteObjectFn DeleteObject;
+    SelectObjectFn SelectObject;
 } ProviderPrivate;
 
 /**
@@ -393,6 +431,7 @@ static void destroy_provider(void *priv)
     provider_priv->gdi_interop->lpVtbl->Release(provider_priv->gdi_interop);
     provider_priv->factory->lpVtbl->Release(provider_priv->factory);
     FreeLibrary(provider_priv->directwrite_lib);
+    FreeLibrary(provider_priv->gdi32_lib);
     free(provider_priv);
 }
 
@@ -678,8 +717,14 @@ static void match_fonts(void *priv, ASS_Library *lib,
     ProviderPrivate *provider_priv = (ProviderPrivate *)priv;
     IDWriteFont *font = NULL;
     IDWriteFontFamily *fontFamily = NULL;
+    IDWriteFont *fontIter = NULL;
+    IDWriteFontFace *fontFace = NULL;
+    IDWriteFontCollection *fontCollection = NULL;
     LOGFONTW lf;
     HRESULT hr = S_OK;
+    HDC hDC = NULL;
+    HFONT hFont = NULL;
+    HFONT hFontOld = NULL;
 
     memset(&lf, 0, sizeof(LOGFONTW));
     lf.lfWeight = FW_DONTCARE;
@@ -692,32 +737,65 @@ static void match_fonts(void *priv, ASS_Library *lib,
     // lfFaceName can hold up to LF_FACESIZE wchars; truncate longer names
     MultiByteToWideChar(CP_UTF8, 0, name, -1, lf.lfFaceName, LF_FACESIZE-1);
 
-    hr = IDWriteGdiInterop_CreateFontFromLOGFONT(provider_priv->gdi_interop, &lf, &font);
+    hDC = provider_priv->CreateCompatibleDC(NULL);
+    if (!hDC)
+        goto cleanup;
+	
+    hFont = provider_priv->CreateFontIndirectW(&lf);
+    if (!hFont)
+        goto cleanup;
+        
+    hFontOld = provider_priv->SelectObject(hDC, hFont);
+    if (!hFontOld)
+        goto cleanup;
+
+    hr = IDWriteGdiInterop_CreateFontFaceFromHdc(provider_priv->gdi_interop, hDC, &fontFace);
+    if (FAILED(hr) || !fontFace)
+        goto cleanup;
+	
+    hr = IDWriteFactory_GetSystemFontCollection(provider_priv->factory, &fontCollection, FALSE);
+    if (FAILED(hr) || !fontCollection)
+        goto cleanup;
+
+    hr = IDWriteFontCollection_GetFontFromFontFace(fontCollection, fontFace, &font);
     if (FAILED(hr) || !font)
-        return;
+        goto cleanup;
 
     hr = IDWriteFont_GetFontFamily(font, &fontFamily);
-    IDWriteFont_Release(font);
     if (FAILED(hr) || !fontFamily)
-        return;
+        goto cleanup;
 
     UINT32 n = IDWriteFontFamily_GetFontCount(fontFamily);
     for (UINT32 i = 0; i < n; i++) {
-        hr = IDWriteFontFamily_GetFont(fontFamily, i, &font);
+        hr = IDWriteFontFamily_GetFont(fontFamily, i, &fontIter);
         if (FAILED(hr))
             continue;
 
         // Simulations for bold or oblique are sometimes synthesized by
         // DirectWrite. We are only interested in physical fonts.
-        if (IDWriteFont_GetSimulations(font) != 0) {
-            IDWriteFont_Release(font);
+        if (IDWriteFont_GetSimulations(fontIter) != 0) {
+            IDWriteFont_Release(fontIter);
             continue;
         }
 
-        add_font(font, fontFamily, provider);
+        add_font(fontIter, fontFamily, provider);
     }
 
     IDWriteFontFamily_Release(fontFamily);
+
+cleanup:
+	if(hDC)
+        provider_priv->DeleteDC(hDC);
+    if (hFont)
+        provider_priv->DeleteObject(hFont);
+    if (fontFace)
+        IDWriteFontFace_Release(fontFace);
+    if (fontCollection)
+        IDWriteFontCollection_Release(fontCollection);
+    if (fontFamily)
+        IDWriteFontFamily_Release(fontFamily);
+    if (font)
+        IDWriteFont_Release(font);
 }
 
 static void get_substitutions(void *priv, const char *name,
@@ -743,12 +821,6 @@ static ASS_FontProviderFuncs directwrite_callbacks = {
     .get_font_index     = get_font_index,
 };
 
-typedef HRESULT (WINAPI *DWriteCreateFactoryFn)(
-    DWRITE_FACTORY_TYPE factoryType,
-    REFIID              iid,
-    IUnknown            **factory
-);
-
 /*
  * Register the directwrite provider. Upon registering
  * scans all system fonts. The private data for this
@@ -766,9 +838,21 @@ ASS_FontProvider *ass_directwrite_add_provider(ASS_Library *lib,
     ASS_FontProvider *provider = NULL;
     DWriteCreateFactoryFn DWriteCreateFactoryPtr = NULL;
     ProviderPrivate *priv = NULL;
+    HMODULE directwrite_lib = NULL;
+    HMODULE gdi32_lib = NULL;
 
-    HMODULE directwrite_lib = LoadLibraryW(L"Dwrite.dll");
+    CreateCompatibleDCFn CreateCompatibleDCPtr = NULL;
+    CreateFontIndirectWFn CreateFontIndirectWPtr = NULL;
+    DeleteDCFn DeleteDCPtr = NULL;
+    DeleteObjectFn DeleteObjectPtr = NULL;
+    SelectObjectFn SelectObjectPtr = NULL;
+
+    directwrite_lib = LoadLibraryW(L"Dwrite.dll");
     if (!directwrite_lib)
+        goto cleanup;
+
+    gdi32_lib = LoadLibraryW(L"Gdi32.dll");
+    if (!gdi32_lib)
         goto cleanup;
 
     DWriteCreateFactoryPtr =
@@ -777,6 +861,36 @@ ASS_FontProvider *ass_directwrite_add_provider(ASS_Library *lib,
     if (!DWriteCreateFactoryPtr)
         goto cleanup;
 
+    CreateCompatibleDCPtr =
+        (CreateCompatibleDCFn)(void *)GetProcAddress(gdi32_lib,
+                                                      "CreateCompatibleDC");
+    if (!CreateCompatibleDCPtr)
+        goto cleanup;
+
+    CreateFontIndirectWPtr =
+        (CreateFontIndirectWFn)(void *)GetProcAddress(gdi32_lib,
+                                                      "CreateFontIndirectW");
+    if (!CreateFontIndirectWPtr)
+        goto cleanup;
+
+    DeleteDCPtr =
+        (DeleteDCFn)(void *)GetProcAddress(gdi32_lib,
+                                                      "DeleteDC");
+    if (!DeleteDCPtr)
+        goto cleanup;
+
+    DeleteObjectPtr =
+        (DeleteObjectFn)(void *)GetProcAddress(gdi32_lib,
+                                                      "DeleteObject");
+    if (!DeleteObjectPtr)
+        goto cleanup;
+
+    SelectObjectPtr =
+        (SelectObjectFn)(void *)GetProcAddress(gdi32_lib,
+                                                      "SelectObject");
+    if (!SelectObjectPtr)
+        goto cleanup;
+	
     hr = DWriteCreateFactoryPtr(DWRITE_FACTORY_TYPE_SHARED,
                                 &IID_IDWriteFactory,
                                 (IUnknown **) (&dwFactory));
@@ -802,6 +916,12 @@ ASS_FontProvider *ass_directwrite_add_provider(ASS_Library *lib,
     priv->factory = dwFactory;
     priv->gdi_interop = dwGdiInterop;
 
+    priv->CreateCompatibleDC = CreateCompatibleDCPtr;
+    priv->CreateFontIndirectW = CreateFontIndirectWPtr;
+    priv->DeleteDC = DeleteDCPtr;
+    priv->DeleteObject = DeleteObjectPtr;
+    priv->SelectObject = SelectObjectPtr;
+
     provider = ass_font_provider_new(selector, &directwrite_callbacks, priv);
     if (!provider)
         goto cleanup;
@@ -817,6 +937,8 @@ cleanup:
         dwFactory->lpVtbl->Release(dwFactory);
     if (directwrite_lib)
         FreeLibrary(directwrite_lib);
+    if (gdi32_lib)
+        FreeLibrary(gdi32_lib);
 
     return NULL;
 }
